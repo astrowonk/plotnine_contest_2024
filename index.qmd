@@ -15,7 +15,8 @@ The United States publishes natality data for each year going back decades, thou
 
 ::: {.callout-note}
 
-The raw data files to prepare this are several gigabytes of parquet data (or CSV files). This quarto doc will render from 2 relatively small parquet files, but one is still too large for github. A zip file of the parquet files needed to reproduce the figures is [here](https://marcoshuerta.com/for_download/plotnine_contest_data.zip). A standalone repository for this post is available on [github](https://github.com/astrowonk/plotnine_contest_2024)
+The raw data files to prepare this are several gigabytes of parquet data (or CSV files). This quarto doc will render from 2 relatively small parquet files, but one is still too large for Github. A zip file of the parquet files needed to reproduce the figures is [here](https://marcoshuerta.com/for_download/plotnine_contest_data.zip). A standalone repository of the quarto document for this post (without the parquet files) is available on [github](https://github.com/astrowonk/plotnine_contest_2024).
+
 
 :::
 
