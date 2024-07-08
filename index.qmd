@@ -1,0 +1,242 @@
+---
+date: '2024-07-08T20:47:56-04:00'
+draft: true
+title: Plotnine Contest - Birth Month and Latitude
+toc: true
+toc-depth: 5
+toc-expand: true
+css: styles.css
+---
+
+
+### Introduction
+
+The United States publishes natality data for each year going back decades, though often published in extremely challenging [fixed-width formats](https://www.cdc.gov/nchs/data_access/vitalstatsonline.htm). NBER has put all this data together in [convenient formats including CSV from 1968-2022](https://www.nber.org/research/data/vital-statistics-natality-birth-data).[^1].
+
+
+::: {.callout-note}
+
+The raw data files to prepare this are several gigabytes of parquet data. This quarto doc will run from 2 relatively small parquet files, but one is still too big for github. A standalone zip file of the parquet files needed to reproduce the figures is [here](https://marcoshuerta.com/).
+
+:::
+
+[^1]: After 2005, there is no county or location data at all - the only identifier is the state. After 1989, there is county data but most counties report as `999`, as I think only the largest counties identify themselves. For that reason, I'm using data from 1982-1988 Prior to 1982, the CSV files [do not contain](https://data.nber.org/nvss/natality/inputs/pdf/1981/Nat1981doc.pdf) FIPS codes for residence making it a bit [harder to tell which county is which](https://www.nber.org/research/data/national-center-health-statistics-nchs-federal-information-processing-series-fips-state-county-and). 
+
+### Data Preparation 
+
+I used [DuckDB](https://duckdb.org) to convert the large CSV files to parquet[^2]. I increased the `sample_size` parameter so that DuckDB can figure out that which columns are a mix of numbers and strings. Example SQL for DuckDB conversion to parquet is below:
+
+[^2]: DuckDB can even read in [gzipped CSV files](https://duckdb.org/docs/data/csv/overview#parameters), which is handy.
+
+```
+copy (
+    SELECT
+        *
+    FROM
+        read_csv_auto('natl1982.csv', sample_size = 100000)
+) to 'natl1982.parquet' (FORMAT PARQUET);
+```
+
+Once in parquet, I used Polars [scan_parquet](https://docs.pola.rs/api/python/stable/reference/api/polars.scan_parquet.html) to make a [LazyFrame](https://docs.pola.rs/api/python/stable/reference/lazyframe/index.html), then grouped by county FIP code and month to count how many births occurred in each county by month. Then I used pandas [transform](https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.transform.html) to create the birth sum over the entire time period, so I could compute the fraction of births in a county in a month. (e.g. 7% of births in a county occurred in April.)
+
+For the maps, I use county shape files acquired from [this link](https://hub.arcgis.com/datasets/48f9af87daa241c4b267c5931ad3b226/explore). I use Geopandas to merge in the birth count data into the geopandas dataframe that contains the shapes with FIPS.
+
+```{python}
+# | eval: false
+# | code-fold: true
+data1988 = pl.scan_parquet(
+    [
+        'natl1988.parquet',
+        'natl1987.parquet',
+        'natl1986.parquet',
+        'natl1985.parquet',
+        'natl1984.parquet',
+        'natl1983.parquet',
+        'natl1982.parquet',
+    ]
+)
+
+month_counts_polars = (
+    data1988.group_by(['cntyrfip', 'birmon'])
+    .agg(pl.col('birday').len().alias('birth_counts'))
+    .collect()
+    .to_pandas(use_pyarrow_extension_array=True)
+)
+month_counts_polars['BirthMonth'] = pd.Categorical(
+    month_counts_polars['birmon'].apply(lambda x: calendar.month_name[x]),
+    categories=[
+        'January',
+        'February',
+        'March',
+        'April',
+        'May',
+        'June',
+        'July',
+        'August',
+        'September',
+        'October',
+        'November',
+        'December',
+    ],
+)
+month_counts_polars['cntyrfip'] = month_counts_polars['cntyrfip'].astype(int)
+
+lat_lon = pd.read_csv(
+    'https://gist.githubusercontent.com/russellsamora/12be4f9f574e92413ea3f92ce1bc58e6/raw/3f18230058afd7431a5d394dab7eeb0aafd29d81/us_county_latlng.csv'
+)
+month_counts_polars = month_counts_polars.merge(
+    lat_lon, how='left', left_on='cntyrfip', right_on='fips_code'
+)
+month_counts_polars['total_county_births'] = month_counts_polars.groupby(['cntyrfip'])[
+    'birth_counts'
+].transform('sum')
+month_counts_polars['births_month_fraction'] = (
+    month_counts_polars['birth_counts'] / month_counts_polars['total_county_births']
+)
+
+month_counts_polars.to_parquet('reduced_1980s_NHCS_data.parquet')
+
+### County map data
+
+counties = gp.read_file('USA_Counties_626072402819112956/USA_Counties.shp')
+
+counties['int_FIPS'] = counties['FIPS'].astype(int)
+
+counties = counties.to_crs('epsg:4326')
+
+
+only_may = month_counts_polars.query("birmon == 5 and stresfip not in ('02','15') ")
+
+counties_merged = counties.merge(only_may, left_on='int_FIPS', right_on='cntyrfip', how='left')
+counties_merged.to_parquet('reduced_1980s_NHCS_data.parquet')
+
+```
+
+### Birth Distribution by Month depends on Latitude
+
+What pops out from this dataset is how much variance the birth distribution by month varies across the country, especially with latitude. This relationship is known to occur internationally as well [(Martinez-Bakker et al. 2014)](https://doi.org/10.1098/rspb.2013.2438). 
+
+Here are three ways to visualize this correlation between location and the month births are most likely to occur.
+
+
+```{python}
+# | echo: false
+
+
+import geopandas as gp
+from mizani.formatters import percent_format
+import pandas as pd
+
+from plotnine import (
+    ggplot,
+    geom_point,
+    aes,
+    stat_smooth,
+    facet_wrap,
+    theme,
+    labs,
+    scale_y_continuous,
+    theme_seaborn,
+    geom_map,
+    xlim,
+    ylim,
+    scale_color_continuous,
+    scale_color_discrete,
+    scale_alpha_continuous,
+    scale_fill_continuous,
+    scale_size,
+    guides,
+)
+
+```
+
+#### A Map Of (Some) Counties showing fraction of births in May.
+
+You can see the trend here. Why not color fill all the counties? Well, low population counties are noisy (small sample size), so the trend between location and birth month is fuzzier. Plus they have more extreme variation and compress the color scale. Many low population counties have a large land mass, so if filled in, they visually dominate the map. 
+
+```{python}
+# | code-fold: true
+
+counties_merged = gp.read_parquet('geopandas_data.parquet')
+
+month_counts_polars = pd.read_parquet('reduced_1980s_NHCS_data.parquet')
+
+(
+    ggplot()
+    + geom_map(counties_merged, fill='lightgrey', stroke='1')
+    + geom_map(
+        counties_merged.query('POP2010 > 15000 and births_month_fraction > 0'),
+        aes(fill='births_month_fraction'),
+    )
+    ## keep map centered on continental US
+    + xlim(-125, -67)
+    + ylim(25, 49)
+    + theme(figure_size=(16, 8))
+    + labs(
+        title='US Large Counties - Fraction of Births in May 1982-1988',
+        fill='Fraction Born in May',
+    )
+    + scale_fill_continuous(cmap_name='plasma', labels=percent_format())
+)
+```
+
+#### Birth Percentages for Months by Latitude
+
+A faceted scatterplot shows the trend for more populous counties.
+
+```{python}
+# | error: false
+# | code-fold: true
+# | label: fig-scatter-plot
+# | width: 80%
+
+(
+    ggplot(
+        month_counts_polars.query(
+            "total_county_births > 15000 and stresfip not in ('02','15')"
+        ).dropna(subset=['lat', 'births_month_fraction']),
+        aes('lat', 'births_month_fraction', color='BirthMonth'),
+    )
+    + geom_point()
+    + stat_smooth(method='lm', color='darkred')
+    + facet_wrap('BirthMonth')
+    + theme(figure_size=(16, 8))
+    + guides(fill='none')
+    + scale_color_discrete(guide=None)
+    + labs(
+        y='Month Percentage of Total Births',
+        x='Latitude of County',
+        title='US High Population Counties - Fraction of Births by Month',
+        color='Birth Month',
+    )
+    + scale_y_continuous(labels=percent_format())
+)
+```
+
+#### Once more, with circles.
+
+Here's another map, but instead of coloring in the county surface area, I used a colored circle on the map, with the size representing the population of the county. This reduces the visual prominence of the physically large counties.
+
+
+```{python}
+# | code-fold: true
+
+(
+    ggplot()
+    + geom_map(counties_merged, fill='lightgrey', stroke='1')
+    + geom_point(
+        counties_merged.query('POP2010 > 15000 and births_month_fraction > 0'),
+        aes(x='lng', y='lat', size='POP2010', color='births_month_fraction', alpha=0.5),
+    )
+    + xlim(-125, -67)
+    + ylim(25, 49)
+    + theme(figure_size=(16, 8))
+    + labs(
+        title='US Large Counties - Fraction of Births in May 1982-1988',
+        color='Fraction Born in May',
+    )
+    + scale_size(range=(2, 28), guide=None)
+    + scale_alpha_continuous(guide=None)
+    + scale_color_continuous(cmap_name='plasma', labels=percent_format())
+)
+```
